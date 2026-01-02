@@ -28,6 +28,7 @@ import (
 	"github.com/haiwen/seafile-server/fileserver/searpc"
 	"github.com/haiwen/seafile-server/fileserver/share"
 	"github.com/haiwen/seafile-server/fileserver/utils"
+	_ "github.com/lib/pq"
 	log "github.com/sirupsen/logrus"
 
 	"net/http/pprof"
@@ -95,19 +96,42 @@ func loadCcnetDB() {
 	}
 
 	var dsn string
-	timeout := "&readTimeout=60s" + "&writeTimeout=60s"
-	if dbOpt.UseTLS && dbOpt.SkipVerify {
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, timeout)
-	} else if dbOpt.UseTLS && !dbOpt.SkipVerify {
-		registerCA(dbOpt.CaPath)
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, timeout)
+	if dbOpt.DBEngine == "postgresql" {
+		// PostgreSQL connection string
+		dsn = fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			dbOpt.Host, dbOpt.Port, dbOpt.User, dbOpt.Password, dbOpt.CcnetDbName)
+
+		if dbOpt.UseTLS {
+			if dbOpt.SkipVerify {
+				dsn = fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
+					dbOpt.Host, dbOpt.Port, dbOpt.User, dbOpt.Password, dbOpt.CcnetDbName)
+			} else {
+				dsn = fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=verify-full",
+					dbOpt.Host, dbOpt.Port, dbOpt.User, dbOpt.Password, dbOpt.CcnetDbName)
+				if dbOpt.CaPath != "" {
+					dsn = fmt.Sprintf("%s sslrootcert=%s", dsn, dbOpt.CaPath)
+				}
+			}
+		}
+
+		ccnetDB, err = sql.Open("postgres", dsn)
 	} else {
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, dbOpt.UseTLS, timeout)
+		// MySQL connection (existing code)
+		timeout := "&readTimeout=60s" + "&writeTimeout=60s"
+		if dbOpt.UseTLS && dbOpt.SkipVerify {
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, timeout)
+		} else if dbOpt.UseTLS && !dbOpt.SkipVerify {
+			registerCA(dbOpt.CaPath)
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, timeout)
+		} else {
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.CcnetDbName, dbOpt.UseTLS, timeout)
+		}
+		if dbOpt.Charset != "" {
+			dsn = fmt.Sprintf("%s&charset=%s", dsn, dbOpt.Charset)
+		}
+		ccnetDB, err = sql.Open("mysql", dsn)
 	}
-	if dbOpt.Charset != "" {
-		dsn = fmt.Sprintf("%s&charset=%s", dsn, dbOpt.Charset)
-	}
-	ccnetDB, err = sql.Open("mysql", dsn)
+
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}
@@ -138,20 +162,42 @@ func loadSeafileDB() {
 	}
 
 	var dsn string
-	timeout := "&readTimeout=60s" + "&writeTimeout=60s"
-	if dbOpt.UseTLS && dbOpt.SkipVerify {
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, timeout)
-	} else if dbOpt.UseTLS && !dbOpt.SkipVerify {
-		registerCA(dbOpt.CaPath)
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, timeout)
+	if dbOpt.DBEngine == "postgresql" {
+		// PostgreSQL connection string
+		dsn = fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=disable",
+			dbOpt.Host, dbOpt.Port, dbOpt.User, dbOpt.Password, dbOpt.SeafileDbName)
+
+		if dbOpt.UseTLS {
+			if dbOpt.SkipVerify {
+				dsn = fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=require",
+					dbOpt.Host, dbOpt.Port, dbOpt.User, dbOpt.Password, dbOpt.SeafileDbName)
+			} else {
+				dsn = fmt.Sprintf("host=%s port=%d user=%s password=%s dbname=%s sslmode=verify-full",
+					dbOpt.Host, dbOpt.Port, dbOpt.User, dbOpt.Password, dbOpt.SeafileDbName)
+				if dbOpt.CaPath != "" {
+					dsn = fmt.Sprintf("%s sslrootcert=%s", dsn, dbOpt.CaPath)
+				}
+			}
+		}
+
+		seafileDB, err = sql.Open("postgres", dsn)
 	} else {
-		dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, dbOpt.UseTLS, timeout)
-	}
-	if dbOpt.Charset != "" {
-		dsn = fmt.Sprintf("%s&charset=%s", dsn, dbOpt.Charset)
+		// MySQL connection (existing code)
+		timeout := "&readTimeout=60s" + "&writeTimeout=60s"
+		if dbOpt.UseTLS && dbOpt.SkipVerify {
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=skip-verify%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, timeout)
+		} else if dbOpt.UseTLS && !dbOpt.SkipVerify {
+			registerCA(dbOpt.CaPath)
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=custom%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, timeout)
+		} else {
+			dsn = fmt.Sprintf("%s:%s@tcp(%s:%d)/%s?tls=%t%s", dbOpt.User, dbOpt.Password, dbOpt.Host, dbOpt.Port, dbOpt.SeafileDbName, dbOpt.UseTLS, timeout)
+		}
+		if dbOpt.Charset != "" {
+			dsn = fmt.Sprintf("%s&charset=%s", dsn, dbOpt.Charset)
+		}
+		seafileDB, err = sql.Open("mysql", dsn)
 	}
 
-	seafileDB, err = sql.Open("mysql", dsn)
 	if err != nil {
 		log.Fatalf("Failed to open database: %v", err)
 	}

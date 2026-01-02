@@ -9,6 +9,7 @@ AM_CFLAGS = -DPKGDATADIR=\"$(pkgdatadir)\" \
 	@GLIB2_CFLAGS@ \
 	@FUSE_CFLAGS@ \
 	@MYSQL_CFLAGS@ \
+	@POSTGRESQL_CFLAGS@ \
 	-Wall
 
 bin_PROGRAMS = seaf-fuse
@@ -43,5 +44,5 @@ seaf_fuse_LDADD = @GLIB2_LIBS@ @GOBJECT_LIBS@ @SSL_LIBS@ @LIB_RT@ @LIB_UUID@ \
                   -lsqlite3 @LIBEVENT_LIBS@ \
 		  $(top_builddir)/common/cdc/libcdc.la \
 		  @SEARPC_LIBS@ @JANSSON_LIBS@ @FUSE_LIBS@ @ZLIB_LIBS@ \
-		  @MYSQL_LIBS@ -lsqlite3 @ARGON2_LIBS@
+		  @MYSQL_LIBS@ @POSTGRESQL_LIBS@ -lsqlite3 @ARGON2_LIBS@
 

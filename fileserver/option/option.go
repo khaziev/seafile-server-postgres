@@ -384,8 +384,12 @@ func loadDBOptionFromFile(centralDir string) (*DBOption, error) {
 	if err == nil {
 		dbEngine = key.String()
 	}
-	if dbEngine != "mysql" {
+	if dbEngine != "mysql" && dbEngine != "postgresql" && dbEngine != "pgsql" {
 		return nil, fmt.Errorf("unsupported database %s.", dbEngine)
+	}
+	// Normalize pgsql to postgresql
+	if dbEngine == "pgsql" {
+		dbEngine = "postgresql"
 	}
 	dbOpt.DBEngine = dbEngine
 	if key, err = section.GetKey("host"); err == nil {

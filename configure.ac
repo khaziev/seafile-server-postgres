@@ -242,6 +242,23 @@ else
     AC_DEFINE([HAVE_MYSQL], 1, [Define to 1 if MySQL support is enabled])
 fi
 
+AC_ARG_WITH(postgresql,
+            AC_HELP_STRING([--with-postgresql],[enable PostgreSQL support]),
+            [with_postgresql=$withval],
+            [with_postgresql=auto])
+
+if test "x${with_postgresql}" != "xno"; then
+    PKG_CHECK_MODULES(POSTGRESQL, [libpq >= 9.3], [have_postgresql="yes"], [have_postgresql="no"])
+
+    if test "x${have_postgresql}" = "xyes"; then
+        AC_SUBST(POSTGRESQL_CFLAGS)
+        AC_SUBST(POSTGRESQL_LIBS)
+        AC_DEFINE([HAVE_POSTGRESQL], 1, [Define to 1 if PostgreSQL support is enabled])
+    elif test "x${with_postgresql}" = "xyes"; then
+        AC_MSG_ERROR([PostgreSQL requested but libpq not found])
+    fi
+fi
+
 if test "${compile_httpserver}" = "yes"; then
     AC_DEFINE([HAVE_EVHTP], [1], [Define to 1 if httpserver is enabled.])
     AC_SUBST(EVHTP_LIBS, "-levhtp")

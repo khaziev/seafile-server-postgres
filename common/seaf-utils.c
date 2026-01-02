@@ -317,6 +317,11 @@ load_database_config (SeafileSession *session)
     if (type && strcasecmp (type, "sqlite") == 0) {
         ret = sqlite_db_start (session);
     }
+#ifdef HAVE_POSTGRESQL
+    else if (type && (strcasecmp (type, "pgsql") == 0 || strcasecmp (type, "postgresql") == 0)) {
+        ret = pgsql_db_start (session);
+    }
+#endif
 #ifdef HAVE_MYSQL
     else {
         ret = mysql_db_start (session);
@@ -375,6 +380,33 @@ ccnet_init_mysql_database (SeafileSession *session)
 
 #endif
 
+#ifdef HAVE_POSTGRESQL
+
+static int
+ccnet_init_pgsql_database (SeafileSession *session)
+{
+    DBOption *option = NULL;
+
+    option = load_db_option (session);
+    if (!option) {
+        seaf_warning ("Failed to load database config.\n");
+        return -1;
+    }
+
+    session->ccnet_db = seaf_db_new_pgsql (option->host, option->port, option->user, option->passwd, option->ccnet_db_name,
+                                           NULL, option->max_connections);
+    if (!session->ccnet_db) {
+        db_option_free (option);
+        seaf_warning ("Failed to open ccnet database.\n");
+        return -1;
+    }
+
+    db_option_free (option);
+    return 0;
+}
+
+#endif
+
 int
 load_ccnet_database_config (SeafileSession *session)
 {
@@ -387,6 +419,12 @@ load_ccnet_database_config (SeafileSession *session)
         seaf_message ("Use database sqlite\n");
         ret = ccnet_init_sqlite_database (session);
     }
+#ifdef HAVE_POSTGRESQL
+    else if (engine && (strcasecmp (engine, "pgsql") == 0 || strcasecmp (engine, "postgresql") == 0)) {
+        seaf_message ("Use database PostgreSQL\n");
+        ret = ccnet_init_pgsql_database (session);
+    }
+#endif
 #ifdef HAVE_MYSQL
     else {
         seaf_message("Use database Mysql\n");

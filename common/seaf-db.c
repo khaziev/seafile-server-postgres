@@ -10,6 +10,9 @@
 #include <mysql.h>
 #include <errmsg.h>
 #endif
+#ifdef HAVE_POSTGRESQL
+#include <libpq-fe.h>
+#endif
 #include <sqlite3.h>
 #include <pthread.h>
 
@@ -1587,3 +1590,531 @@ sqlite_db_row_get_column_int64 (SeafDBRow *vrow, int idx)
 
     return sqlite3_column_int64 (row->stmt, idx);
 }
+
+#ifdef HAVE_POSTGRESQL
+
+/* PostgreSQL DB */
+
+typedef struct PgSQLDB {
+    struct SeafDB parent;
+    char *host;
+    char *user;
+    char *password;
+    unsigned int port;
+    char *db_name;
+    char *unix_socket;
+} PgSQLDB;
+
+typedef struct PgSQLDBConnection {
+    struct DBConnection parent;
+    PGconn *db_conn;
+} PgSQLDBConnection;
+
+typedef struct PgSQLDBRow {
+    SeafDBRow parent;
+    PGresult *result;
+    int current_row;
+    int column_count;
+} PgSQLDBRow;
+
+static SeafDB *
+pgsql_db_new (const char *host,
+              unsigned int port,
+              const char *user,
+              const char *password,
+              const char *db_name,
+              const char *unix_socket);
+static DBConnection *
+pgsql_db_get_connection (SeafDB *db);
+static void
+pgsql_db_release_connection (DBConnection *vconn);
+static int
+pgsql_db_execute_sql_no_stmt (DBConnection *vconn, const char *sql, gboolean *retry);
+static int
+pgsql_db_execute_sql (DBConnection *vconn, const char *sql, int n, va_list args, gboolean *retry);
+static int
+pgsql_db_query_foreach_row (DBConnection *vconn, const char *sql,
+                            SeafDBRowFunc callback, void *data,
+                            int n, va_list args, gboolean *retry);
+static int
+pgsql_db_row_get_column_count (SeafDBRow *row);
+static const char *
+pgsql_db_row_get_column_string (SeafDBRow *row, int idx);
+static int
+pgsql_db_row_get_column_int (SeafDBRow *row, int idx);
+static gint64
+pgsql_db_row_get_column_int64 (SeafDBRow *row, int idx);
+static gboolean
+pgsql_db_connection_ping (DBConnection *vconn);
+
+static DBConnection *
+pgsql_conn_pool_get_connection (SeafDB *db)
+{
+    DBConnPool *pool = db->pool;
+    DBConnection *conn = NULL;
+    DBConnection *d_conn = NULL;
+
+    if (pool->max_connections == 0) {
+        conn = pgsql_db_get_connection (db);
+        conn->pool = pool;
+        return conn;
+    }
+
+    pthread_mutex_lock (&pool->lock);
+
+    guint i, size = pool->connections->len;
+    for (i = 0; i < size; ++i) {
+        conn = g_ptr_array_index (pool->connections, i);
+        if (!conn->is_available) {
+            continue;
+        }
+        if (pgsql_db_connection_ping (conn)) {
+            conn->is_available = FALSE;
+            goto out;
+        }
+        conn->is_available = FALSE;
+        conn->delete_pending = TRUE;
+    }
+    conn = NULL;
+    if (size < pool->max_connections) {
+        conn = pgsql_db_get_connection (db);
+        if (conn) {
+            conn->pool = pool;
+            conn->is_available = FALSE;
+            g_ptr_array_add (pool->connections, conn);
+        }
+    }
+
+out:
+    size = pool->connections->len;
+    if (size > 0) {
+        int index;
+        for (index = size - 1; index >= 0; index--) {
+            d_conn = g_ptr_array_index (pool->connections, index);
+            if (d_conn->delete_pending) {
+                g_ptr_array_remove (pool->connections, d_conn);
+                pgsql_db_release_connection (d_conn);
+            }
+        }
+    }
+    pthread_mutex_unlock (&pool->lock);
+    return conn;
+}
+
+static void
+pgsql_conn_pool_release_connection (DBConnection *conn, gboolean need_close)
+{
+    if (!conn)
+        return;
+
+    if (conn->pool->max_connections == 0) {
+        pgsql_db_release_connection (conn);
+        return;
+    }
+
+    if (need_close) {
+        pthread_mutex_lock (&conn->pool->lock);
+        g_ptr_array_remove (conn->pool->connections, conn);
+        pthread_mutex_unlock (&conn->pool->lock);
+        pgsql_db_release_connection (conn);
+        return;
+    }
+
+    pthread_mutex_lock (&conn->pool->lock);
+    conn->is_available = TRUE;
+    pthread_mutex_unlock (&conn->pool->lock);
+}
+
+static void *
+pgsql_conn_keepalive (void *arg)
+{
+    DBConnPool *pool = arg;
+    DBConnection *conn = NULL;
+    DBConnection *d_conn = NULL;
+    char *sql = "SELECT 1;";
+    int rc = 0;
+    va_list args;
+
+    while (1) {
+        pthread_mutex_lock (&pool->lock);
+
+        guint i, size = pool->connections->len;
+        for (i = 0; i < size; ++i) {
+            conn = g_ptr_array_index (pool->connections, i);
+            if (conn->is_available) {
+                rc = db_ops.execute_sql (conn, sql, 0, args, NULL);
+                if (rc < 0) {
+                    conn->is_available = FALSE;
+                    conn->delete_pending = TRUE;
+                }
+            }
+        }
+
+        if (size > 0) {
+            int index;
+            for (index = size - 1; index >= 0; index--) {
+                d_conn = g_ptr_array_index (pool->connections, index);
+                if (d_conn->delete_pending) {
+                    g_ptr_array_remove (pool->connections, d_conn);
+                    pgsql_db_release_connection (d_conn);
+                }
+            }
+        }
+
+        pthread_mutex_unlock (&pool->lock);
+
+        sleep (KEEPALIVE_INTERVAL);
+    }
+
+    return NULL;
+}
+
+SeafDB *
+seaf_db_new_pgsql (const char *host,
+                   unsigned int port,
+                   const char *user,
+                   const char *passwd,
+                   const char *db_name,
+                   const char *unix_socket,
+                   int max_connections)
+{
+    SeafDB *db;
+
+    db = pgsql_db_new (host, port, user, passwd, db_name, unix_socket);
+    if (!db)
+        return NULL;
+    db->type = SEAF_DB_TYPE_PGSQL;
+
+    db_ops.get_connection = pgsql_conn_pool_get_connection;
+    db_ops.release_connection = pgsql_conn_pool_release_connection;
+    db_ops.execute_sql_no_stmt = pgsql_db_execute_sql_no_stmt;
+    db_ops.execute_sql = pgsql_db_execute_sql;
+    db_ops.query_foreach_row = pgsql_db_query_foreach_row;
+    db_ops.row_get_column_count = pgsql_db_row_get_column_count;
+    db_ops.row_get_column_string = pgsql_db_row_get_column_string;
+    db_ops.row_get_column_int = pgsql_db_row_get_column_int;
+    db_ops.row_get_column_int64 = pgsql_db_row_get_column_int64;
+
+    db->pool = init_conn_pool_common (max_connections);
+
+    pthread_t tid;
+    int ret = pthread_create (&tid, NULL, pgsql_conn_keepalive, db->pool);
+    if (ret != 0) {
+        seaf_warning ("Failed to create pgsql connection keepalive thread.\n");
+        return NULL;
+    }
+    pthread_detach (tid);
+
+    return db;
+}
+
+static gboolean
+pgsql_db_connection_ping (DBConnection *vconn)
+{
+    PgSQLDBConnection *conn = (PgSQLDBConnection *)vconn;
+
+    return (PQstatus (conn->db_conn) == CONNECTION_OK);
+}
+
+static SeafDB *
+pgsql_db_new (const char *host,
+              unsigned int port,
+              const char *user,
+              const char *password,
+              const char *db_name,
+              const char *unix_socket)
+{
+    PgSQLDB *db = g_new0 (PgSQLDB, 1);
+
+    db->host = g_strdup (host);
+    db->user = g_strdup (user);
+    db->password = g_strdup (password);
+    db->port = port ? port : 5432;
+    db->db_name = g_strdup (db_name);
+    db->unix_socket = g_strdup (unix_socket);
+
+    return (SeafDB *)db;
+}
+
+static DBConnection *
+pgsql_db_get_connection (SeafDB *vdb)
+{
+    PgSQLDB *db = (PgSQLDB *)vdb;
+    PGconn *db_conn;
+    PgSQLDBConnection *conn = NULL;
+    char conninfo[2048];
+
+    if (db->unix_socket) {
+        snprintf (conninfo, sizeof(conninfo),
+                  "host=%s port=%u user=%s password=%s dbname=%s",
+                  db->unix_socket, db->port, db->user, db->password, db->db_name);
+    } else {
+        snprintf (conninfo, sizeof(conninfo),
+                  "host=%s port=%u user=%s password=%s dbname=%s",
+                  db->host, db->port, db->user, db->password, db->db_name);
+    }
+
+    db_conn = PQconnectdb (conninfo);
+    if (!db_conn || PQstatus (db_conn) != CONNECTION_OK) {
+        seaf_warning ("Failed to connect to PostgreSQL: %s\n",
+                      PQerrorMessage (db_conn));
+        if (db_conn)
+            PQfinish (db_conn);
+        return NULL;
+    }
+
+    conn = g_new0 (PgSQLDBConnection, 1);
+    conn->db_conn = db_conn;
+
+    return (DBConnection *)conn;
+}
+
+static void
+pgsql_db_release_connection (DBConnection *vconn)
+{
+    if (!vconn)
+        return;
+
+    PgSQLDBConnection *conn = (PgSQLDBConnection *)vconn;
+
+    PQfinish (conn->db_conn);
+
+    g_free (conn);
+}
+
+static int
+pgsql_db_execute_sql_no_stmt (DBConnection *vconn, const char *sql, gboolean *retry)
+{
+    PgSQLDBConnection *conn = (PgSQLDBConnection *)vconn;
+    PGresult *result;
+
+    result = PQexec (conn->db_conn, sql);
+    if (!result || (PQresultStatus (result) != PGRES_COMMAND_OK &&
+                    PQresultStatus (result) != PGRES_TUPLES_OK)) {
+        seaf_warning ("Failed to execute sql %s: %s\n",
+                      sql, PQerrorMessage (conn->db_conn));
+        if (result)
+            PQclear (result);
+
+        if (PQstatus (conn->db_conn) != CONNECTION_OK) {
+            if (retry)
+                *retry = TRUE;
+        }
+        return -1;
+    }
+
+    PQclear (result);
+    return 0;
+}
+
+static int
+_bind_params_pgsql (int n, va_list args, char ***param_values, int **param_lengths, int **param_formats)
+{
+    int i;
+    const char *type;
+
+    *param_values = g_new0 (char *, n);
+    *param_lengths = g_new0 (int, n);
+    *param_formats = g_new0 (int, n);
+
+    for (i = 0; i < n; ++i) {
+        type = va_arg (args, const char *);
+        (*param_formats)[i] = 0; // text format
+
+        if (strcmp (type, "int") == 0) {
+            int x = va_arg (args, int);
+            (*param_values)[i] = g_strdup_printf ("%d", x);
+        } else if (strcmp (type, "int64") == 0) {
+            gint64 x = va_arg (args, gint64);
+            (*param_values)[i] = g_strdup_printf ("%" G_GINT64_FORMAT, x);
+        } else if (strcmp (type, "string") == 0) {
+            const char *s = va_arg (args, const char *);
+            (*param_values)[i] = s ? g_strdup (s) : NULL;
+        } else {
+            seaf_warning ("BUG: invalid prep stmt parameter type %s.\n", type);
+            g_return_val_if_reached (-1);
+        }
+    }
+
+    return 0;
+}
+
+static int
+pgsql_db_execute_sql (DBConnection *vconn, const char *sql, int n, va_list args, gboolean *retry)
+{
+    PgSQLDBConnection *conn = (PgSQLDBConnection *)vconn;
+    PGconn *db = conn->db_conn;
+    char **param_values = NULL;
+    int *param_lengths = NULL;
+    int *param_formats = NULL;
+    PGresult *result = NULL;
+    int ret = 0;
+
+    if (n > 0) {
+        if (_bind_params_pgsql (n, args, &param_values, &param_lengths, &param_formats) < 0) {
+            seaf_warning ("Failed to bind parameters for %s\n", sql);
+            return -1;
+        }
+    }
+
+    result = PQexecParams (db, sql, n, NULL, (const char * const *)param_values,
+                           param_lengths, param_formats, 0);
+
+    if (!result || (PQresultStatus (result) != PGRES_COMMAND_OK &&
+                    PQresultStatus (result) != PGRES_TUPLES_OK)) {
+        seaf_warning ("Failed to execute sql %s: %s\n",
+                      sql, PQerrorMessage (db));
+        ret = -1;
+
+        if (PQstatus (db) != CONNECTION_OK) {
+            if (retry)
+                *retry = TRUE;
+        }
+    }
+
+    if (result)
+        PQclear (result);
+
+    if (param_values) {
+        int i;
+        for (i = 0; i < n; ++i) {
+            g_free (param_values[i]);
+        }
+        g_free (param_values);
+        g_free (param_lengths);
+        g_free (param_formats);
+    }
+
+    return ret;
+}
+
+static int
+pgsql_db_query_foreach_row (DBConnection *vconn, const char *sql,
+                             SeafDBRowFunc callback, void *data,
+                             int n, va_list args, gboolean *retry)
+{
+    PgSQLDBConnection *conn = (PgSQLDBConnection *)vconn;
+    PGconn *db = conn->db_conn;
+    char **param_values = NULL;
+    int *param_lengths = NULL;
+    int *param_formats = NULL;
+    PGresult *result = NULL;
+    int nrows = 0;
+    int i;
+
+    if (n > 0) {
+        if (_bind_params_pgsql (n, args, &param_values, &param_lengths, &param_formats) < 0) {
+            nrows = -1;
+            goto out;
+        }
+    }
+
+    result = PQexecParams (db, sql, n, NULL, (const char * const *)param_values,
+                           param_lengths, param_formats, 0);
+
+    if (!result || PQresultStatus (result) != PGRES_TUPLES_OK) {
+        seaf_warning ("Failed to execute sql %s: %s\n",
+                      sql, PQerrorMessage (db));
+        nrows = -1;
+
+        if (PQstatus (db) != CONNECTION_OK) {
+            if (retry)
+                *retry = TRUE;
+        }
+        goto out;
+    }
+
+    nrows = PQntuples (result);
+
+    if (callback) {
+        PgSQLDBRow row;
+        memset (&row, 0, sizeof(row));
+        row.result = result;
+        row.column_count = PQnfields (result);
+
+        for (i = 0; i < nrows; ++i) {
+            row.current_row = i;
+            if (!callback ((SeafDBRow *)&row, data))
+                break;
+        }
+    }
+
+out:
+    if (result)
+        PQclear (result);
+
+    if (param_values) {
+        for (i = 0; i < n; ++i) {
+            g_free (param_values[i]);
+        }
+        g_free (param_values);
+        g_free (param_lengths);
+        g_free (param_formats);
+    }
+
+    return nrows;
+}
+
+static int
+pgsql_db_row_get_column_count (SeafDBRow *vrow)
+{
+    PgSQLDBRow *row = (PgSQLDBRow *)vrow;
+    return row->column_count;
+}
+
+static const char *
+pgsql_db_row_get_column_string (SeafDBRow *vrow, int idx)
+{
+    PgSQLDBRow *row = (PgSQLDBRow *)vrow;
+
+    if (PQgetisnull (row->result, row->current_row, idx))
+        return NULL;
+
+    return PQgetvalue (row->result, row->current_row, idx);
+}
+
+static int
+pgsql_db_row_get_column_int (SeafDBRow *vrow, int idx)
+{
+    const char *str;
+    char *e;
+    int ret;
+
+    str = pgsql_db_row_get_column_string (vrow, idx);
+    if (!str) {
+        return 0;
+    }
+
+    errno = 0;
+    ret = strtol (str, &e, 10);
+    if (errno || (e == str)) {
+        seaf_warning ("Number conversion failed.\n");
+        return -1;
+    }
+
+    return ret;
+}
+
+static gint64
+pgsql_db_row_get_column_int64 (SeafDBRow *vrow, int idx)
+{
+    const char *str;
+    char *e;
+    gint64 ret;
+
+    str = pgsql_db_row_get_column_string (vrow, idx);
+    if (!str) {
+        return 0;
+    }
+
+    errno = 0;
+    ret = strtoll (str, &e, 10);
+    if (errno || (e == str)) {
+        seaf_warning ("Number conversion failed.\n");
+        return -1;
+    }
+
+    return ret;
+}
+
+#endif  /* HAVE_POSTGRESQL */
