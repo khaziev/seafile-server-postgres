@@ -60,6 +60,24 @@ typedef struct DBOperations {
 
 static DBOperations db_ops;
 
+#if defined(HAVE_MYSQL) || defined(HAVE_POSTGRESQL)
+
+/* Common connection pool functions */
+#define KEEPALIVE_INTERVAL 30
+
+static DBConnPool *
+init_conn_pool_common (int max_connections)
+{
+    DBConnPool *pool = g_new0(DBConnPool, 1);
+    pool->connections = g_ptr_array_sized_new (max_connections);
+    pthread_mutex_init (&pool->lock, NULL);
+    pool->max_connections = max_connections;
+
+    return pool;
+}
+
+#endif  /* HAVE_MYSQL || HAVE_POSTGRESQL */
+
 #ifdef HAVE_MYSQL
 
 /* MySQL Ops */
@@ -96,17 +114,6 @@ static gint64
 mysql_db_row_get_column_int64 (SeafDBRow *row, int idx);
 static gboolean
 mysql_db_connection_ping (DBConnection *vconn);
-
-static DBConnPool *
-init_conn_pool_common (int max_connections)
-{
-    DBConnPool *pool = g_new0(DBConnPool, 1);
-    pool->connections = g_ptr_array_sized_new (max_connections);
-    pthread_mutex_init (&pool->lock, NULL);
-    pool->max_connections = max_connections;
-
-    return pool;
-}
 
 static DBConnection *
 mysql_conn_pool_get_connection (SeafDB *db)
@@ -186,7 +193,6 @@ mysql_conn_pool_release_connection (DBConnection *conn, gboolean need_close)
     pthread_mutex_unlock (&conn->pool->lock);
 }
 
-#define KEEPALIVE_INTERVAL 30
 static void *
 mysql_conn_keepalive (void *arg)
 {

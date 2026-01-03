@@ -272,7 +272,21 @@ PKG_CHECK_MODULES(CURL, [libcurl >= $CURL_REQUIRED])
 AC_SUBST(CURL_CFLAGS)
 AC_SUBST(CURL_LIBS)
 
-PKG_CHECK_MODULES(JWT, [libjwt])
+PKG_CHECK_MODULES(JWT, [libjwt], [], [
+    # libjwt may not have pkg-config (v3.x uses cmake), check manually
+    save_LDFLAGS="$LDFLAGS"
+    save_LIBS="$LIBS"
+    LDFLAGS="$LDFLAGS -L/usr/local/lib"
+    LIBS="$LIBS -ljansson -lcrypto"
+    AC_CHECK_LIB([jwt], [jwt_new], [
+        JWT_CFLAGS="-I/usr/local/include"
+        JWT_LIBS="-L/usr/local/lib -ljwt"
+    ], [
+        AC_MSG_ERROR([libjwt library not found. Install from https://github.com/benmcollins/libjwt])
+    ])
+    LDFLAGS="$save_LDFLAGS"
+    LIBS="$save_LIBS"
+])
 AC_SUBST(JWT_CFLAGS)
 AC_SUBST(JWT_LIBS)
 

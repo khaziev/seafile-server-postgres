@@ -56,9 +56,10 @@ sqlite_db_start (SeafileSession *session)
     return 0;
 }
 
-#ifdef HAVE_MYSQL
+#if defined(HAVE_MYSQL) || defined(HAVE_POSTGRESQL)
 
 #define MYSQL_DEFAULT_PORT 3306
+#define PGSQL_DEFAULT_PORT 5432
 
 typedef struct DBOption {
     char *user;
@@ -218,6 +219,10 @@ out:
 
     return option;
 }
+
+#endif  /* HAVE_MYSQL || HAVE_POSTGRESQL */
+
+#ifdef HAVE_MYSQL
 
 static int
 mysql_db_start (SeafileSession *session)
